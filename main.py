@@ -29,7 +29,6 @@ def setup_logging(verbose: bool = False) -> None:
     )
     # Quiet noisy libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("playwright").setLevel(logging.WARNING)
 
 
 def main() -> None:
@@ -41,7 +40,6 @@ Examples:
   python main.py                    # Run continuous scanner
   python main.py --once             # Run a single scan
   python main.py --min-ev 5         # Only show bets with 5%+ EV
-  python main.py --no-headless      # Show the browser window
   python main.py --markets fouls,corners  # Only scan specific markets
         """,
     )
@@ -61,11 +59,6 @@ Examples:
         type=int,
         default=None,
         help="Scan interval in seconds (default: from .env or 120)",
-    )
-    parser.add_argument(
-        "--no-headless",
-        action="store_true",
-        help="Show the browser window (useful for debugging)",
     )
     parser.add_argument(
         "--markets",
@@ -95,8 +88,6 @@ Examples:
         config.MIN_EV_PERCENT = args.min_ev
     if args.interval is not None:
         config.SCAN_INTERVAL_SECONDS = args.interval
-    if args.no_headless:
-        config.HEADLESS = False
     if args.markets:
         config.MARKETS = args.markets.split(",")
     if args.bookmakers:

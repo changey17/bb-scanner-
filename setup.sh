@@ -11,9 +11,6 @@ source .venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Install Playwright browsers
-playwright install chromium
-
 # Create .env from example if it doesn't exist
 if [ ! -f .env ]; then
     cp .env.example .env
