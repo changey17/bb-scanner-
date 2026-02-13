@@ -15,6 +15,8 @@ class MarketType(Enum):
     GOALS = "goals"
     BOOKINGS = "bookings"
     OFFSIDES = "offsides"
+    TACKLES = "tackles"
+    PASSES = "passes"
 
 
 class BetDirection(Enum):

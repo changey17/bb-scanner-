@@ -24,11 +24,28 @@ from src.scrapers.bb_client import BBClient
 
 logger = logging.getLogger(__name__)
 
+# Target bookmakers - normalised names to match against BB's bookmaker list
+TARGET_BOOKMAKERS = {
+    "bet365", "paddy power", "paddypower", "sky bet", "skybet",
+    "betfair", "betfair sportsbook", "william hill", "williamhill",
+    "betfred",
+}
+
 # Stats-related keywords for filtering coupons
 STATS_KEYWORDS = [
     "foul", "throw", "corner", "card", "booking", "shot",
     "offside", "tackle", "free kick", "goal kick",
+    "player",  # player-level stats markets
 ]
+
+
+def _is_target_bookmaker(name: str) -> bool:
+    """Check if bookmaker name matches one of our target bookmakers."""
+    normalised = name.lower().strip()
+    for target in TARGET_BOOKMAKERS:
+        if target in normalised or normalised in target:
+            return True
+    return False
 
 
 def _detect_market_type(text: str) -> MarketType | None:
@@ -38,10 +55,12 @@ def _detect_market_type(text: str) -> MarketType | None:
         (["foul"], MarketType.FOULS),
         (["throw in", "throw-in", "throwin"], MarketType.THROW_INS),
         (["corner"], MarketType.CORNERS),
-        (["card", "booking point"], MarketType.CARDS),
-        (["shot on target", "sot"], MarketType.SHOTS_ON_TARGET),
+        (["card", "booking point", "yellow", "red card"], MarketType.CARDS),
+        (["shot on target", "sot", "shots on target"], MarketType.SHOTS_ON_TARGET),
         (["shot"], MarketType.SHOTS),
         (["offside"], MarketType.OFFSIDES),
+        (["tackle"], MarketType.TACKLES),
+        (["pass", "passes"], MarketType.PASSES),
     ]
     for keywords, mtype in checks:
         if any(kw in text_lower for kw in keywords):
@@ -66,6 +85,16 @@ def _parse_direction(text: str) -> BetDirection | None:
 def _parse_line(text: str) -> float:
     match = re.search(r"(\d+\.?\d*)", text)
     return float(match.group(1)) if match else 0.0
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    """Safely convert a value to float, returning default on failure."""
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
 
 
 class BBCouponsScraper:
@@ -127,6 +156,10 @@ class BBCouponsScraper:
             book_id = coupon.get("bookid")
             bookie_name = book_map.get(book_id, str(book_id))
 
+            # Filter: only target bookmakers
+            if not _is_target_bookmaker(bookie_name):
+                continue
+
             market_type = _detect_market_type(coupon_name)
 
             if stats_only and not _is_stats_coupon(coupon_name) and not market_type:
@@ -139,8 +172,8 @@ class BBCouponsScraper:
                 continue
 
             for sel in selections:
-                book_odds = float(sel.get("book_odds", 0))
-                lay_price = float(sel.get("lay", 0))
+                book_odds = _safe_float(sel.get("book_odds"))
+                lay_price = _safe_float(sel.get("lay"))
 
                 if book_odds <= 1.0 or lay_price <= 1.0:
                     continue
@@ -152,8 +185,12 @@ class BBCouponsScraper:
                     continue
 
                 sel_name = sel.get("name", "")
+                combined_text = f"{coupon_name} {sel_name}"
                 direction = _parse_direction(sel_name) or _parse_direction(coupon_name)
                 line = _parse_line(sel_name) or _parse_line(coupon_name)
+
+                # Detect market from combined coupon + selection text
+                sel_market = _detect_market_type(combined_text) or market_type
 
                 event = sel.get("events") or {}
                 match = Match(
@@ -166,7 +203,7 @@ class BBCouponsScraper:
                 vb = ValueBet(
                     match=match,
                     bookmaker=bookie_name,
-                    market_type=market_type or MarketType.GOALS,
+                    market_type=sel_market or MarketType.GOALS,
                     selection=f"{coupon_name} - {sel_name}",
                     line=line,
                     direction=direction,

@@ -36,7 +36,7 @@ class Config:
 
     # Bookmakers
     BOOKMAKERS: list[str] = os.getenv(
-        "BOOKMAKERS", "bet365,paddypower,williamhill,ladbrokes,skybet,betfred"
+        "BOOKMAKERS", "bet365,paddypower,williamhill,skybet,betfair,betfred"
     ).split(",")
 
     # Browser settings

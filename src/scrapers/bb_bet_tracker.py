@@ -25,6 +25,13 @@ from src.scrapers.bb_client import BBClient
 
 logger = logging.getLogger(__name__)
 
+# Target bookmakers - normalised names to match against BB's bookmaker list
+TARGET_BOOKMAKERS = {
+    "bet365", "paddy power", "paddypower", "sky bet", "skybet",
+    "betfair", "betfair sportsbook", "william hill", "williamhill",
+    "betfred",
+}
+
 # Market type detection patterns
 STATS_PATTERNS = {
     MarketType.FOULS: [r"foul", r"fouls?\s+(?:won|committed)"],
@@ -35,7 +42,28 @@ STATS_PATTERNS = {
     MarketType.SHOTS: [r"(?<!on\s)shots?\b"],
     MarketType.SHOTS_ON_TARGET: [r"shots?\s+on\s+target", r"\bsot\b"],
     MarketType.OFFSIDES: [r"offside"],
+    MarketType.TACKLES: [r"tackle"],
+    MarketType.PASSES: [r"pass(?:es)?"],
 }
+
+
+def _is_target_bookmaker(name: str) -> bool:
+    """Check if bookmaker name matches one of our target bookmakers."""
+    normalised = name.lower().strip()
+    for target in TARGET_BOOKMAKERS:
+        if target in normalised or normalised in target:
+            return True
+    return False
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    """Safely convert a value to float, returning default on failure."""
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
 
 
 def _match_market_type(text: str) -> MarketType | None:
@@ -126,10 +154,14 @@ class BBBetTrackerScraper:
             vb = self._parse_bet(bet, book_map)
             if vb is None:
                 continue
+            # Filter: only target bookmakers
+            if not _is_target_bookmaker(vb.bookmaker):
+                continue
             if stats_only and vb.market_type not in {
                 MarketType.FOULS, MarketType.THROW_INS, MarketType.CORNERS,
                 MarketType.CARDS, MarketType.BOOKINGS, MarketType.SHOTS,
                 MarketType.SHOTS_ON_TARGET, MarketType.OFFSIDES,
+                MarketType.TACKLES, MarketType.PASSES,
             }:
                 continue
             if vb.ev_percent < min_ev_percent:
@@ -143,13 +175,8 @@ class BBBetTrackerScraper:
     def _parse_bet(self, bet: dict, book_map: dict) -> ValueBet | None:
         """Parse a raw bet record into a ValueBet."""
         name = bet.get("name", "")
-        ev_raw = bet.get("ev", 0)
-
-        # BB stores EV as a percentage where 100 = fair value
-        # So ev=105 means 5% positive EV
-        try:
-            ev_value = float(ev_raw)
-        except (ValueError, TypeError):
+        ev_value = _safe_float(bet.get("ev"))
+        if ev_value == 0.0:
             return None
 
         # Get odds
@@ -158,19 +185,17 @@ class BBBetTrackerScraper:
 
         for key in ["book_odds", "odds", "price"]:
             if key in bet:
-                try:
-                    book_odds = float(bet[key])
+                val = _safe_float(bet[key])
+                if val > 0:
+                    book_odds = val
                     break
-                except (ValueError, TypeError):
-                    pass
 
         for key in ["lay", "fair_odds", "exchange_odds"]:
             if key in bet:
-                try:
-                    fair_odds = float(bet[key])
+                val = _safe_float(bet[key])
+                if val > 0:
+                    fair_odds = val
                     break
-                except (ValueError, TypeError):
-                    pass
 
         if book_odds <= 1.0 or fair_odds <= 1.0:
             # Try to calculate from EV

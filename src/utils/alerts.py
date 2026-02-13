@@ -61,31 +61,32 @@ async def send_discord_alert(bets: list[ValueBet], config: Config) -> None:
     embeds = []
     for bet in bets[:10]:  # Discord limits embeds
         direction_str = f" {bet.direction.value.upper()}" if bet.direction else ""
+        line_str = f" {bet.line}" if bet.line else ""
         embeds.append(
             {
-                "title": f"Value Bet: {bet.match.display_name}",
+                "title": f"{bet.bookmaker} | {bet.match.display_name}",
                 "color": 0x00FF00 if bet.ev_percent >= 5 else 0xFFFF00,
                 "fields": [
-                    {"name": "League", "value": bet.match.league, "inline": True},
+                    {"name": "League", "value": bet.match.league or "—", "inline": True},
                     {
                         "name": "Market",
-                        "value": f"{bet.market_type.value}{direction_str} {bet.line}",
+                        "value": f"{bet.market_type.value}{direction_str}{line_str}",
+                        "inline": True,
+                    },
+                    {
+                        "name": "EV",
+                        "value": f"**{bet.ev_percent:+.1f}%**",
                         "inline": True,
                     },
                     {"name": "Selection", "value": bet.selection, "inline": False},
                     {
-                        "name": "Bookmaker",
-                        "value": f"{bet.bookmaker} @ {bet.book_odds:.2f}",
+                        "name": "Book Odds",
+                        "value": f"**{bet.book_odds:.2f}**",
                         "inline": True,
                     },
                     {
                         "name": "Fair Odds",
                         "value": f"{bet.fair_odds:.2f}",
-                        "inline": True,
-                    },
-                    {
-                        "name": "EV",
-                        "value": f"{bet.ev_percent:+.1f}%",
                         "inline": True,
                     },
                 ],
