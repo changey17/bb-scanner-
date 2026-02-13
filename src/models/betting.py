@@ -90,6 +90,9 @@ class ValueBet:
     book_odds: float
     fair_odds: float
     ev_percent: float
+    stats_avg: float | None = None  # Real player season average (per 90)
+    stats_supported: bool | None = None  # Whether real stats support the bet
+    stats_note: str = ""  # Explanation of stats validation
     timestamp: datetime = field(default_factory=datetime.now)
 
     @property

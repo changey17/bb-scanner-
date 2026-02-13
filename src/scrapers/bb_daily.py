@@ -3,8 +3,11 @@
 Uses the Node.js REST API at /node/rest/goals/list to fetch live football
 match data including player-level stats odds from bookmakers.
 
-Fair odds are computed using Poisson distribution to derive expected stats
-from bookmaker over/under lines, then comparing across bookmakers.
+Fair odds are computed using BB's own methodology:
+1. Poisson reverse-engineering of expected stats from bookmaker odds
+2. Optimism adjustment (from BB's config) applied to fair probability
+3. Polynomial adjustment (A*x² + B*x + C, clamped to [D, E]) on the mean
+4. Trimmed mean across bookmakers for consensus fair value
 
 Auth uses custom headers extracted from the vue_config element on the page:
     X-BB-User, X-BB-Hash, X-BB-Userid, X-BB-Userlevel
@@ -58,6 +61,23 @@ MARKET_MAP = {
     "overGoalKicks": (MarketType.GOALS, BetDirection.OVER),
 }
 
+# Map market keys to BB config stat names (for optimism/polynomial lookup)
+MARKET_TO_STAT = {
+    "overSot": "shots",
+    "underSot": "shots",
+    "overShots": "player_shots",
+    "underShots": "player_shots",
+    "overFouls": "fouls",
+    "overFoulsWon": "foulswon",
+    "overTackles": "tackles",
+    "overPasses": "passes",
+    "overOffsides": "shots",
+    "overPlayer_cards": "player_cards",
+    "overAssists": "assists",
+    "overSaves": "saves",
+    "overGoalKicks": "shots",
+}
+
 # Stat markets we care about (football stats focus)
 STATS_MARKETS = {
     "overSot", "underSot", "overShots", "underShots",
@@ -67,6 +87,9 @@ STATS_MARKETS = {
 
 BASE_URL = "https://www.bookiebashing.net/node"
 DAILY_PAGE = "https://www.bookiebashing.net/tools/daily/"
+
+# Sub percentage: player-level stats reduced by this % (bench/sub time)
+DEFAULT_SUB_PERCENTAGE = 9.5
 
 
 # --- Poisson math (mirrors BB's JavaScript calculations) ---
@@ -91,12 +114,13 @@ def _poisson_over(mean: float, line: float) -> float:
 def _fair_odds_from_bookie_market(
     over_odds: float,
     over_under_odds: list[float],
-    optimism: float = 50,
+    optimism: float | None = None,
 ) -> float:
     """Derive fair probability from a bookmaker's over/under market.
 
     Mirrors BB's fairOddsFromBookieMarket$1 function.
     Uses the power method when both over and under are available.
+    optimism: BB's optimism setting (0-100, where lower = more pessimistic on over).
     """
     if over_odds is None or over_odds <= 1.0:
         return float("inf")
@@ -104,13 +128,14 @@ def _fair_odds_from_bookie_market(
     total_implied = sum(1.0 / o for o in over_under_odds if o > 0)
 
     if len(over_under_odds) == 2 and all(o > 0 for o in over_under_odds):
-        # Power method: fair_prob = (2 - (total - 1) * over_odds) / (2 * over_odds)
+        # Power method
         fair_prob = (2 - (total_implied - 1) * over_odds) / (2 * over_odds)
 
-        if optimism != 50:
+        if optimism is not None and optimism != 50:
             opt = 100 - optimism
+            overround = 1 - (1 / over_under_odds[0] + 1 / over_under_odds[1])
             if opt > 50:
-                margin = 1.0 / over_odds + (1 - total_implied) - fair_prob
+                margin = 1.0 / over_odds + overround - fair_prob
                 fair_prob += margin * (opt - 50) / 50
             elif opt < 50:
                 margin = fair_prob - 1.0 / over_odds
@@ -131,16 +156,23 @@ def _reverse_poisson_over(fair_over_odds: float, line: int) -> float:
 
     lo, hi = 0.0, 1000.0
     mid = 500.0
-    target_prob = 1.0 / fair_over_odds
 
     for _ in range(100):
         prob = _poisson_over(mid, line)
-        if abs(prob - target_prob) < 0.0005 or abs(hi - lo) < 0.0005:
-            break
-        if prob > target_prob:
+        if prob <= 0:
+            target = 1.0 / fair_over_odds
+            if abs(0 - target) < 0.0005:
+                break
             hi = mid
-        else:
+            mid = (lo + hi) / 2.0
+            continue
+        current_odds = 1.0 / prob
+        if abs(current_odds - fair_over_odds) < 0.0005 or abs(hi - lo) < 0.0005:
+            break
+        if current_odds > fair_over_odds:
             lo = mid
+        else:
+            hi = mid
         mid = (lo + hi) / 2.0
 
     return mid
@@ -154,11 +186,38 @@ def _poisson_fair_over(mean: float, line: float) -> float:
     return 1.0 / prob
 
 
+def _apply_polynomial(mean: float, poly_config: dict | None) -> float:
+    """Apply BB's polynomial adjustment to a Poisson mean.
+
+    BB's formula: adjustment = min(E, max(D, A*x² + B*x + C))
+    Then: adjusted_mean = mean * adjustment
+
+    Uses the 'player' polynomial for individual player stats.
+    """
+    if not poly_config or not isinstance(poly_config, dict):
+        return mean
+
+    player_poly = poly_config.get("player", {})
+    if not player_poly:
+        return mean
+
+    a = float(player_poly.get("A", 0) or 0)
+    b = float(player_poly.get("B", 0) or 0)
+    c = float(player_poly.get("C", 1) or 1)
+    d = float(player_poly.get("D", 0) or 0)
+    e = float(player_poly.get("E", 2) or 2)
+
+    adjustment = a * mean**2 + b * mean + c
+    adjustment = min(e, max(d, adjustment))
+
+    return mean * adjustment
+
+
 def _estimate_mean_from_odds(
     over_odds: float,
     under_odds: float | None,
     handicap: float,
-    optimism: float = 50,
+    optimism: float | None = None,
 ) -> float:
     """Estimate expected stat value from bookmaker odds using reverse Poisson."""
     line = math.floor(handicap)
@@ -168,7 +227,7 @@ def _estimate_mean_from_odds(
             over_odds, [over_odds, under_odds], optimism
         )
     else:
-        fair_over = over_odds  # Use raw odds as approximation
+        fair_over = over_odds
 
     return _reverse_poisson_over(fair_over, line)
 
@@ -178,6 +237,7 @@ class BBDailyScraper:
 
     def __init__(self, config: Config | None = None):
         self.config = config or Config()
+        self._bb_config: dict | None = None
 
     async def _extract_vue_config(self, client: BBClient) -> dict:
         """Extract vue_config from the daily page."""
@@ -209,14 +269,38 @@ class BBDailyScraper:
         return resp.json()
 
     async def get_games(self, client: BBClient) -> tuple[list[dict], dict]:
-        """Fetch all live football games from the daily goals API."""
+        """Fetch all live football games and BB config from the daily goals API."""
         vue_config = await self._extract_vue_config(client)
+
+        # Fetch BB's goals config (optimism, polynomial, etc.)
+        bb_config = await self._api_get(client, vue_config, "/rest/goals/config")
+        if isinstance(bb_config, dict):
+            self._bb_config = bb_config
+            logger.info("Loaded BB goals config (optimism, polynomials)")
+
         games = await self._api_get(client, vue_config, "/rest/goals/list")
         if not isinstance(games, list):
             logger.error("Unexpected goals/list response type: %s", type(games))
             return [], vue_config
         logger.info("Daily Goals: %d games loaded", len(games))
         return games, vue_config
+
+    def _get_optimism(self, stat_name: str) -> float | None:
+        """Get BB's optimism setting for a stat type."""
+        if not self._bb_config:
+            return None
+        optimism = self._bb_config.get("optimism", {})
+        val = optimism.get(stat_name)
+        if val is not None and val > -1:
+            return val
+        return optimism.get("shots")
+
+    def _get_polynomial(self, stat_name: str) -> dict | None:
+        """Get BB's polynomial config for a stat type."""
+        if not self._bb_config:
+            return None
+        poly = self._bb_config.get("optimismPolynomial", {})
+        return poly.get(stat_name, poly.get("shots"))
 
     def _extract_player_value_bets(
         self,
@@ -225,11 +309,12 @@ class BBDailyScraper:
     ) -> list[ValueBet]:
         """Extract value bets from a single game's playerStatsData.
 
-        For each player+market, we:
-        1. Collect Poisson mean estimates from ALL bookmakers (for fair value)
-        2. Take the trimmed mean as the consensus "fair" expected stat
-        3. Compute fair odds for each target bookmaker's specific line
-        4. Compare to bookmaker's offered price to find +EV bets
+        Uses BB's own fair value methodology:
+        1. For each bookmaker, derive Poisson mean using BB's optimism setting
+        2. Average means across bookmakers (trimmed if 5+)
+        3. Apply BB's polynomial adjustment to the consensus mean
+        4. Compute fair odds from adjusted mean using Poisson
+        5. Compare target bookmaker's price to fair odds
 
         Requires at least 2 bookmakers total to establish a fair mean.
         """
@@ -253,9 +338,7 @@ class BBDailyScraper:
         )
 
         # Step 1: Collect data from ALL bookmakers per player per market
-        # all_data: {player: {market: [(bookie_raw, odds, handicap, under_odds)]}}
         all_data: dict[str, dict[str, list[tuple]]] = {}
-        # target_entries: {player: {market: [(bookie_display, odds, handicap)]}}
         target_entries: dict[str, dict[str, list[tuple]]] = {}
 
         for bookie_raw, players in psd.items():
@@ -278,7 +361,6 @@ class BBDailyScraper:
                     if not odds or odds <= 1.0:
                         continue
 
-                    # Under odds for fair value calc
                     under_key = market_key.replace("over", "under")
                     under_odds = None
                     if under_key != market_key and under_key in markets:
@@ -286,12 +368,10 @@ class BBDailyScraper:
                         if isinstance(under_data, dict):
                             under_odds = under_data.get("odds")
 
-                    # Store in all_data for fair mean
                     all_data.setdefault(player_name, {}).setdefault(market_key, []).append(
                         (bookie_raw, odds, handicap, under_odds)
                     )
 
-                    # Store target bookmaker entries
                     if is_target:
                         display = TARGET_BOOKMAKERS[bookie_raw]
                         target_entries.setdefault(player_name, {}).setdefault(market_key, []).append(
@@ -301,42 +381,56 @@ class BBDailyScraper:
         # Step 2: For each player+market with target bookmaker entries
         for player_name, markets in target_entries.items():
             for market_key, targets in markets.items():
-                # Get all bookmaker data for fair mean
                 all_entries = all_data.get(player_name, {}).get(market_key, [])
                 if len(all_entries) < 2:
-                    continue  # Need 2+ bookmakers for reliable fair value
+                    continue
 
                 market_info = MARKET_MAP.get(market_key)
                 if not market_info:
                     continue
                 market_type, direction = market_info
 
-                # Compare each target bookmaker against others
+                # Get BB's config for this stat type
+                stat_name = MARKET_TO_STAT.get(market_key, "shots")
+                optimism = self._get_optimism(stat_name)
+                polynomial = self._get_polynomial(stat_name)
+
                 for display_name, odds, handicap in targets:
                     # Estimate fair mean from OTHER bookmakers (exclude self)
                     means = []
+                    has_under = False
                     for other_bookie, other_odds, other_hcap, other_under in all_entries:
-                        # Skip the same bookmaker
                         if TARGET_BOOKMAKERS.get(other_bookie) == display_name:
                             continue
+                        if other_under and other_under > 0:
+                            has_under = True
                         est_mean = _estimate_mean_from_odds(
-                            other_odds, other_under, other_hcap
+                            other_odds, other_under, other_hcap, optimism
                         )
                         if 0 < est_mean < 100:
                             means.append(est_mean)
 
                     if len(means) < 3:
-                        continue  # Need 3+ independent sources for reliability
+                        continue
 
-                    # Trimmed mean for robustness
+                    # Trim if 5+ means and only-over (no under markets)
                     means.sort()
-                    if len(means) >= 5:
+                    if not has_under and len(means) > 5:
+                        means = means[1:-1]
+                    elif len(means) >= 5:
                         trimmed = means[1:-1]
-                    elif len(means) >= 3:
-                        trimmed = means[1:]
-                    else:
-                        trimmed = means
-                    fair_mean = sum(trimmed) / len(trimmed)
+                        means = trimmed
+
+                    fair_mean = sum(means) / len(means)
+
+                    # Apply BB's polynomial adjustment
+                    fair_mean = _apply_polynomial(fair_mean, polynomial)
+
+                    # Apply sub percentage reduction for player-level stats
+                    sub_pct = DEFAULT_SUB_PERCENTAGE
+                    if self._bb_config:
+                        sub_pct = self._bb_config.get("subPercentage", sub_pct)
+                    fair_mean *= (1 - sub_pct / 100)
 
                     fair_odds = _poisson_fair_over(fair_mean, handicap)
 
@@ -371,12 +465,15 @@ class BBDailyScraper:
         self,
         client: BBClient,
         min_ev_percent: float = 2.0,
+        stats_provider=None,
     ) -> list[ValueBet]:
-        """Scrape all player stats value bets from the Daily Goals tool."""
+        """Scrape all player stats value bets from the Daily Goals tool.
+
+        If stats_provider is given, validates bets against real player stats.
+        """
         games, _ = await self.get_games(client)
         value_bets = []
 
-        # Only process upcoming games (not past)
         now_ms = time.time() * 1000
         upcoming = [g for g in games if g.get("startTime", 0) > now_ms - 7200000]
         logger.info("Processing %d upcoming games for player stats", len(upcoming))
@@ -388,6 +485,87 @@ class BBDailyScraper:
             bets = self._extract_player_value_bets(game, min_ev_percent)
             value_bets.extend(bets)
 
+        # Validate against real player stats if available
+        if stats_provider and stats_provider.is_available:
+            await self._validate_with_stats(value_bets, stats_provider)
+
         value_bets.sort(key=lambda b: b.ev_percent, reverse=True)
         logger.info("Daily Player Stats: %d value bets found", len(value_bets))
         return value_bets
+
+    async def _validate_with_stats(
+        self, bets: list[ValueBet], stats_provider
+    ) -> None:
+        """Enrich value bets with real player stats from API-Football."""
+        from src.utils.player_stats import PlayerStatsProvider
+
+        if not isinstance(stats_provider, PlayerStatsProvider):
+            return
+
+        # Group bets by player to minimize API calls
+        player_bets: dict[str, list[ValueBet]] = {}
+        for bet in bets:
+            # Extract player name from selection (format: "Player Name - Over SOT 0.5")
+            parts = bet.selection.split(" - ", 1)
+            player_name = parts[0].strip() if parts else bet.selection
+            player_bets.setdefault(player_name, []).append(bet)
+
+        validated = 0
+        for player_name, player_bet_list in player_bets.items():
+            if not stats_provider.is_available:
+                break
+
+            # Use first bet's match info for lookup
+            first_bet = player_bet_list[0]
+            league = first_bet.match.league
+            team = first_bet.match.home_team  # Best guess
+
+            stats = await stats_provider.get_player_stats(
+                player_name, team, league
+            )
+            if not stats:
+                continue
+
+            for bet in player_bet_list:
+                # Determine original market key from selection
+                market_key = self._selection_to_market_key(bet.selection)
+                if not market_key:
+                    continue
+
+                real_avg = stats.get_stat(market_key)
+                if real_avg is not None:
+                    bet.stats_avg = real_avg
+                    supported, note = stats_provider.validate_bet(
+                        stats, market_key, bet.line, 0
+                    )
+                    bet.stats_supported = supported
+                    bet.stats_note = note
+                    validated += 1
+
+        logger.info("Stats validation: %d bets validated", validated)
+
+    @staticmethod
+    def _selection_to_market_key(selection: str) -> str | None:
+        """Convert selection text back to BB market key for stats lookup."""
+        sel = selection.lower()
+        if "over sot" in sel or "over  sot" in sel:
+            return "overSot"
+        if "under sot" in sel or "under  sot" in sel:
+            return "underSot"
+        if "over shots" in sel:
+            return "overShots"
+        if "under shots" in sel:
+            return "underShots"
+        if "over fouls won" in sel:
+            return "overFoulsWon"
+        if "over fouls" in sel:
+            return "overFouls"
+        if "over tackles" in sel:
+            return "overTackles"
+        if "over passes" in sel:
+            return "overPasses"
+        if "over offsides" in sel:
+            return "overOffsides"
+        if "over cards" in sel:
+            return "overPlayer_cards"
+        return None

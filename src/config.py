@@ -39,6 +39,9 @@ class Config:
         "BOOKMAKERS", "bet365,paddypower,williamhill,skybet,betfair,betfred"
     ).split(",")
 
+    # Player stats validation (optional - API-Football free tier: 100 req/day)
+    API_FOOTBALL_KEY: str = os.getenv("API_FOOTBALL_KEY", "")
+
     # Browser settings
     USER_AGENT: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

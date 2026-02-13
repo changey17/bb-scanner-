@@ -14,6 +14,7 @@ from src.scrapers.bb_bet_tracker import BBBetTrackerScraper
 from src.scrapers.bb_client import BBClient
 from src.scrapers.bb_daily import BBDailyScraper
 from src.utils.alerts import send_alerts
+from src.utils.player_stats import PlayerStatsProvider
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -46,6 +47,7 @@ class Scanner:
         self.config = config or Config()
         self.bb_daily = BBDailyScraper(self.config)
         self.bb_bet_tracker = BBBetTrackerScraper(self.config)
+        self.stats_provider = PlayerStatsProvider(self.config)
 
     async def run_scan(self) -> list[ValueBet]:
         """Run a single scan cycle."""
@@ -62,15 +64,23 @@ class Scanner:
             )
 
             # Daily Player Stats (primary source)
-            console.print("[dim]Scanning Daily Player Stats...[/dim]")
+            stats_msg = ""
+            if self.stats_provider.is_available:
+                stats_msg = " (with stats validation)"
+                console.print("[dim]Scanning Daily Player Stats + real stats validation...[/dim]")
+            else:
+                console.print("[dim]Scanning Daily Player Stats...[/dim]")
             try:
                 daily_bets = await self.bb_daily.scrape_value_bets(
                     client,
                     min_ev_percent=self.config.MIN_EV_PERCENT,
+                    stats_provider=self.stats_provider,
                 )
                 all_bets.append(daily_bets)
+                stats_count = sum(1 for b in daily_bets if b.stats_supported is not None)
                 console.print(
-                    f"  [green]Player Stats: {len(daily_bets)} value bets[/green]"
+                    f"  [green]Player Stats: {len(daily_bets)} value bets"
+                    f"{f' ({stats_count} stats-validated)' if stats_count else ''}[/green]"
                 )
             except Exception as e:
                 logger.error("Daily Player Stats failed: %s", e)
@@ -116,6 +126,10 @@ class Scanner:
             f"William Hill, Betfred, Betfair[/dim]"
         )
         console.print(f"[dim]Min EV: {self.config.MIN_EV_PERCENT}%[/dim]")
+        if self.stats_provider.is_available:
+            console.print("[dim]Stats validation: ACTIVE (API-Football)[/dim]")
+        else:
+            console.print("[dim]Stats validation: OFF (set API_FOOTBALL_KEY to enable)[/dim]")
         console.print()
 
         while True:

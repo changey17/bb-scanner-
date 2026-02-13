@@ -35,9 +35,21 @@ def print_value_bets(bets: list[ValueBet]) -> None:
     table.add_column("Book Odds", justify="right", style="bold green")
     table.add_column("Fair Odds", justify="right", style="bold")
     table.add_column("EV%", justify="right", style="bold magenta")
+    table.add_column("Stats", justify="center", width=18)
 
     for bet in sorted(bets, key=lambda b: b.ev_percent, reverse=True):
         ev_style = "bold green" if bet.ev_percent >= 5 else "bold yellow"
+
+        # Stats validation column
+        if bet.stats_supported is True:
+            stats_str = f"[green]{bet.stats_avg:.1f}/90 OK[/green]"
+        elif bet.stats_supported is False:
+            stats_str = f"[red]{bet.stats_avg:.1f}/90 WEAK[/red]"
+        elif bet.stats_avg is not None:
+            stats_str = f"[dim]{bet.stats_avg:.1f}/90[/dim]"
+        else:
+            stats_str = "[dim]—[/dim]"
+
         table.add_row(
             bet.match.display_name,
             bet.match.league,
@@ -47,6 +59,7 @@ def print_value_bets(bets: list[ValueBet]) -> None:
             f"{bet.book_odds:.2f}",
             f"{bet.fair_odds:.2f}",
             f"[{ev_style}]{bet.ev_percent:+.1f}%[/{ev_style}]",
+            stats_str,
         )
 
     console.print(table)
@@ -89,6 +102,14 @@ async def send_discord_alert(bets: list[ValueBet], config: Config) -> None:
                         "value": f"{bet.fair_odds:.2f}",
                         "inline": True,
                     },
+                    *([{
+                        "name": "Stats",
+                        "value": (
+                            f"{'OK' if bet.stats_supported else 'WEAK'} "
+                            f"({bet.stats_avg:.1f}/90) {bet.stats_note}"
+                        ),
+                        "inline": False,
+                    }] if bet.stats_avg is not None else []),
                 ],
                 "timestamp": bet.timestamp.isoformat(),
             }
