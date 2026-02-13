@@ -12,7 +12,7 @@ from src.config import Config
 from src.models.betting import ValueBet
 from src.scrapers.bb_bet_tracker import BBBetTrackerScraper
 from src.scrapers.bb_client import BBClient
-from src.scrapers.bb_coupons import BBCouponsScraper
+from src.scrapers.bb_daily import BBDailyScraper
 from src.utils.alerts import send_alerts
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ class Scanner:
 
     def __init__(self, config: Config | None = None):
         self.config = config or Config()
-        self.bb_coupons = BBCouponsScraper(self.config)
+        self.bb_daily = BBDailyScraper(self.config)
         self.bb_bet_tracker = BBBetTrackerScraper(self.config)
 
     async def run_scan(self) -> list[ValueBet]:
@@ -61,11 +61,22 @@ class Scanner:
                 f"[green]Logged in as {client.username}[/green]"
             )
 
-            # Load bookmaker list first
-            books = await client.get_bookmakers()
-            console.print(f"[dim]{len(books)} bookmakers loaded[/dim]")
+            # Daily Player Stats (primary source)
+            console.print("[dim]Scanning Daily Player Stats...[/dim]")
+            try:
+                daily_bets = await self.bb_daily.scrape_value_bets(
+                    client,
+                    min_ev_percent=self.config.MIN_EV_PERCENT,
+                )
+                all_bets.append(daily_bets)
+                console.print(
+                    f"  [green]Player Stats: {len(daily_bets)} value bets[/green]"
+                )
+            except Exception as e:
+                logger.error("Daily Player Stats failed: %s", e)
+                console.print(f"  [red]Player Stats failed: {e}[/red]")
 
-            # Bet Tracker
+            # Bet Tracker (supplementary)
             console.print("[dim]Scanning Bet Tracker...[/dim]")
             try:
                 tracker_bets = await self.bb_bet_tracker.scrape_value_bets(
@@ -80,22 +91,6 @@ class Scanner:
             except Exception as e:
                 logger.error("Bet Tracker failed: %s", e)
                 console.print(f"  [red]Bet Tracker failed: {e}[/red]")
-
-            # Coupons Tracker
-            console.print("[dim]Scanning Coupons Tracker...[/dim]")
-            try:
-                coupon_bets = await self.bb_coupons.scrape_value_bets(
-                    client,
-                    stats_only=False,
-                    min_ev_percent=self.config.MIN_EV_PERCENT,
-                )
-                all_bets.append(coupon_bets)
-                console.print(
-                    f"  [green]Coupons: {len(coupon_bets)} value bets[/green]"
-                )
-            except Exception as e:
-                logger.error("Coupons Tracker failed: %s", e)
-                console.print(f"  [red]Coupons failed: {e}[/red]")
 
         # Merge and deduplicate
         final_bets = _merge_value_bets(*all_bets)
@@ -116,7 +111,10 @@ class Scanner:
             f"{self.config.SCAN_INTERVAL_SECONDS}s[/bold]"
         )
         console.print(f"[dim]Markets: {', '.join(self.config.MARKETS)}[/dim]")
-        console.print(f"[dim]Bookmakers: {', '.join(self.config.BOOKMAKERS)}[/dim]")
+        console.print(
+            f"[dim]Bookmakers: Bet365, Paddy Power, Sky Bet, "
+            f"William Hill, Betfred, Betfair[/dim]"
+        )
         console.print(f"[dim]Min EV: {self.config.MIN_EV_PERCENT}%[/dim]")
         console.print()
 
