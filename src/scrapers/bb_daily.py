@@ -348,10 +348,6 @@ class BBDailyScraper:
                     if ev_percent < min_ev_percent:
                         continue
 
-                    # Cap extreme outliers (likely data/definition mismatches)
-                    if ev_percent > 30:
-                        continue
-
                     stat_label = market_key.replace("over", "Over ").replace("under", "Under ")
                     stat_label = stat_label.replace("Sot", "SOT").replace("Player_cards", "Cards")
                     stat_label = stat_label.replace("FoulsWon", "Fouls Won")
