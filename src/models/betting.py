@@ -106,12 +106,10 @@ class ValueBet:
         return (self.book_odds / self.fair_odds - 1) * 100
 
     def format_alert(self) -> str:
-        direction_str = f" {self.direction.value.upper()}" if self.direction else ""
         return (
             f"VALUE BET | {self.match.display_name}\n"
             f"  League: {self.match.league}\n"
-            f"  Market: {self.market_type.value}{direction_str} {self.line}\n"
-            f"  Selection: {self.selection}\n"
+            f"  Market: {self.selection}\n"
             f"  Bookmaker: {self.bookmaker} @ {self.book_odds:.2f}\n"
             f"  Fair Odds: {self.fair_odds:.2f}\n"
             f"  EV: {self.ev_percent:+.1f}%\n"

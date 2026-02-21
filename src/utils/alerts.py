@@ -73,8 +73,6 @@ async def send_discord_alert(bets: list[ValueBet], config: Config) -> None:
 
     embeds = []
     for bet in bets[:10]:  # Discord limits embeds
-        direction_str = f" {bet.direction.value.upper()}" if bet.direction else ""
-        line_str = f" {bet.line}" if bet.line else ""
         embeds.append(
             {
                 "title": f"{bet.bookmaker} | {bet.match.display_name}",
@@ -83,7 +81,7 @@ async def send_discord_alert(bets: list[ValueBet], config: Config) -> None:
                     {"name": "League", "value": bet.match.league or "—", "inline": True},
                     {
                         "name": "Market",
-                        "value": f"{bet.market_type.value}{direction_str}{line_str}",
+                        "value": bet.selection,
                         "inline": True,
                     },
                     {
@@ -133,11 +131,9 @@ async def send_telegram_alert(bets: list[ValueBet], config: Config) -> None:
 
     lines = [f"*{len(bets)} Value Bet(s) Found*\n"]
     for bet in bets:
-        direction_str = f" {bet.direction.value.upper()}" if bet.direction else ""
         lines.append(
             f"*{bet.match.display_name}*\n"
             f"  {bet.match.league}\n"
-            f"  {bet.market_type.value}{direction_str} {bet.line}\n"
             f"  {bet.selection}\n"
             f"  {bet.bookmaker} @ `{bet.book_odds:.2f}` | Fair: `{bet.fair_odds:.2f}`\n"
             f"  EV: *{bet.ev_percent:+.1f}%*\n"
