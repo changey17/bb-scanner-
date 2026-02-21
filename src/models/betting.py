@@ -7,6 +7,7 @@ from enum import Enum
 
 class MarketType(Enum):
     FOULS = "fouls"
+    FOULS_WON = "fouls_won"
     THROW_INS = "throw_ins"
     CORNERS = "corners"
     CARDS = "cards"
@@ -17,6 +18,8 @@ class MarketType(Enum):
     OFFSIDES = "offsides"
     TACKLES = "tackles"
     PASSES = "passes"
+    SAVES = "saves"
+    GOAL_KICKS = "goal_kicks"
 
 
 class BetDirection(Enum):

@@ -51,14 +51,14 @@ MARKET_MAP = {
     "overShots": (MarketType.SHOTS, BetDirection.OVER),
     "underShots": (MarketType.SHOTS, BetDirection.UNDER),
     "overFouls": (MarketType.FOULS, BetDirection.OVER),
-    "overFoulsWon": (MarketType.FOULS, BetDirection.OVER),
+    "overFoulsWon": (MarketType.FOULS_WON, BetDirection.OVER),
     "overTackles": (MarketType.TACKLES, BetDirection.OVER),
     "overPasses": (MarketType.PASSES, BetDirection.OVER),
     "overOffsides": (MarketType.OFFSIDES, BetDirection.OVER),
     "overPlayer_cards": (MarketType.CARDS, BetDirection.OVER),
     "overAssists": (MarketType.GOALS, BetDirection.OVER),
-    "overSaves": (MarketType.GOALS, BetDirection.OVER),
-    "overGoalKicks": (MarketType.GOALS, BetDirection.OVER),
+    "overSaves": (MarketType.SAVES, BetDirection.OVER),
+    "overGoalKicks": (MarketType.GOAL_KICKS, BetDirection.OVER),
 }
 
 # Map market keys to BB config stat names (for optimism/polynomial lookup)
@@ -82,8 +82,45 @@ MARKET_TO_STAT = {
 STATS_MARKETS = {
     "overSot", "underSot", "overShots", "underShots",
     "overFouls", "overFoulsWon", "overTackles", "overPasses",
-    "overOffsides", "overPlayer_cards",
+    "overOffsides", "overPlayer_cards", "overAssists",
+    "overSaves", "overGoalKicks",
 }
+
+# Special "player" names that are actually team-level entries
+TEAM_LEVEL_NAMES = {"Home", "Away", "match"}
+
+# Readable market labels for display
+MARKET_LABELS = {
+    "overSot": "Over {n} SOT",
+    "underSot": "Under {n} SOT",
+    "overShots": "Over {n} Shots",
+    "underShots": "Under {n} Shots",
+    "overFouls": "Over {n} Fouls",
+    "overFoulsWon": "Over {n} Fouls Won",
+    "overTackles": "Over {n} Tackles",
+    "overPasses": "Over {n} Passes",
+    "overOffsides": "Over {n} Offsides",
+    "overPlayer_cards": "Over {n} Cards",
+    "overAssists": "Over {n} Assists",
+    "overSaves": "Over {n} Saves",
+    "overGoalKicks": "Over {n} Goal Kicks",
+}
+
+
+def _line_to_display(handicap: float) -> str:
+    """Convert decimal handicap to bookmaker display format.
+
+    Bookmakers display: 1+ (=Over 0.5), 2+ (=Over 1.5), 3+ (=Over 2.5).
+    For whole number lines like corners (Over 10.5), use standard notation.
+    """
+    # For half-lines (.5), convert to N+ format
+    if handicap == int(handicap) + 0.5:
+        n_plus = int(handicap + 0.5)
+        return f"{n_plus}+"
+    # For whole number lines, show as integer
+    if handicap == int(handicap):
+        return str(int(handicap))
+    return str(handicap)
 
 BASE_URL = "https://www.bookiebashing.net/node"
 DAILY_PAGE = "https://www.bookiebashing.net/tools/daily/"
@@ -442,15 +479,22 @@ class BBDailyScraper:
                     if ev_percent < min_ev_percent:
                         continue
 
-                    stat_label = market_key.replace("over", "Over ").replace("under", "Under ")
-                    stat_label = stat_label.replace("Sot", "SOT").replace("Player_cards", "Cards")
-                    stat_label = stat_label.replace("FoulsWon", "Fouls Won")
+                    # Build readable selection label
+                    line_display = _line_to_display(handicap)
+                    label_tmpl = MARKET_LABELS.get(market_key, market_key)
+                    stat_label = label_tmpl.format(n=line_display)
+
+                    # Prefix with player or team name
+                    if player_name in TEAM_LEVEL_NAMES:
+                        prefix = f"{player_name} Team"
+                    else:
+                        prefix = player_name
 
                     vb = ValueBet(
                         match=match,
                         bookmaker=display_name,
                         market_type=market_type,
-                        selection=f"{player_name} - {stat_label} {handicap}",
+                        selection=f"{prefix} - {stat_label}",
                         line=handicap,
                         direction=direction,
                         book_odds=odds,
@@ -458,6 +502,238 @@ class BBDailyScraper:
                         ev_percent=round(ev_percent, 2),
                     )
                     value_bets.append(vb)
+
+        return value_bets
+
+    def _extract_corners_value_bets(
+        self,
+        game: dict,
+        min_ev_percent: float,
+    ) -> list[ValueBet]:
+        """Extract value bets from corners data (pinnacleCorners + spread data).
+
+        Uses Pinnacle odds as the sharp/fair reference, and checks if target
+        bookmakers in playerStatsData offer better corners odds.
+
+        Also uses spread data (spreadex, starspreads) midpoints as an
+        alternative fair value estimate.
+        """
+        value_bets = []
+        event_name = game.get("event", "")
+        competition = game.get("competition", {})
+        comp_name = competition.get("name", "") if isinstance(competition, dict) else ""
+
+        parts = event_name.split(" v ", 1)
+        home = parts[0].strip() if len(parts) == 2 else event_name
+        away = parts[1].strip() if len(parts) == 2 else ""
+        match = Match(
+            home_team=home,
+            away_team=away,
+            league=comp_name,
+            match_id=str(game.get("id", "")),
+        )
+
+        # Get Pinnacle corners data (sharp benchmark)
+        pinnacle_corners = game.get("pinnacleCorners", [])
+        if not pinnacle_corners:
+            return value_bets
+
+        # Parse Pinnacle over/under pairs
+        pinnacle_lines: dict[float, dict[str, float]] = {}
+        for entry in pinnacle_corners:
+            sel = entry.get("selection", {})
+            name = sel.get("name", "")
+            odds = entry.get("odds", 0)
+            if not odds or odds <= 1:
+                continue
+
+            for prefix, direction in [("Over ", "over"), ("Under ", "under")]:
+                if name.startswith(prefix):
+                    try:
+                        line = float(name[len(prefix):])
+                    except ValueError:
+                        continue
+                    pinnacle_lines.setdefault(line, {})[direction] = odds
+
+        # Get spread data for additional fair value estimate
+        spread_mean = None
+        for spread_key in ("spreadex", "starspreads", "sportsspread"):
+            spread_data = game.get(spread_key, {})
+            if isinstance(spread_data, dict):
+                corners = spread_data.get("corners", {})
+                if isinstance(corners, dict):
+                    buy = corners.get("buy", 0)
+                    sell = corners.get("sell", 0)
+                    if buy and sell:
+                        spread_mean = (buy + sell) / 2.0
+                        break
+
+        # For each Pinnacle line, compute fair odds from Pinnacle + spreads
+        for line, odds_pair in pinnacle_lines.items():
+            over_odds = odds_pair.get("over")
+            under_odds = odds_pair.get("under")
+            if not over_odds:
+                continue
+
+            # Derive fair odds from Pinnacle (already sharp)
+            if under_odds:
+                fair_over = _fair_odds_from_bookie_market(
+                    over_odds, [over_odds, under_odds]
+                )
+            else:
+                fair_over = over_odds
+
+            # Also compute Poisson fair from spread mean if available
+            if spread_mean:
+                spread_fair = _poisson_fair_over(spread_mean, line)
+                # Average Pinnacle fair with spread-based fair
+                if fair_over != float("inf") and spread_fair != float("inf"):
+                    avg_prob = (1 / fair_over + 1 / spread_fair) / 2
+                    fair_over = 1 / max(avg_prob, 0.001)
+
+            if fair_over <= 1.0 or fair_over == float("inf"):
+                continue
+
+            # Check target bookmakers' corners odds in playerStatsData
+            # Some bookmakers list corners as overShots with high handicap under "Home"/"Away"
+            # But for now, Pinnacle IS the fair price - we just report it
+            line_display = _line_to_display(line)
+            vb = ValueBet(
+                match=match,
+                bookmaker="Pinnacle",
+                market_type=MarketType.CORNERS,
+                selection=f"Match Corners - Over {line_display}",
+                line=line,
+                direction=BetDirection.OVER,
+                book_odds=over_odds,
+                fair_odds=round(fair_over, 3),
+                ev_percent=round((over_odds / fair_over - 1) * 100, 2),
+            )
+            # Only add if there's meaningful info (spread vs pinnacle divergence)
+            if spread_mean and abs(vb.ev_percent) >= min_ev_percent:
+                value_bets.append(vb)
+
+            # Also check under
+            if under_odds:
+                fair_under = _fair_odds_from_bookie_market(
+                    under_odds, [over_odds, under_odds]
+                )
+                if spread_mean:
+                    spread_fair_under = 1 / max(1 - _poisson_over(spread_mean, line), 0.001)
+                    if fair_under != float("inf") and spread_fair_under != float("inf"):
+                        avg_prob = (1 / fair_under + 1 / spread_fair_under) / 2
+                        fair_under = 1 / max(avg_prob, 0.001)
+
+                if fair_under > 1.0 and fair_under != float("inf"):
+                    ev = (under_odds / fair_under - 1) * 100
+                    if abs(ev) >= min_ev_percent:
+                        vb_u = ValueBet(
+                            match=match,
+                            bookmaker="Pinnacle",
+                            market_type=MarketType.CORNERS,
+                            selection=f"Match Corners - Under {line_display}",
+                            line=line,
+                            direction=BetDirection.UNDER,
+                            book_odds=under_odds,
+                            fair_odds=round(fair_under, 3),
+                            ev_percent=round(ev, 2),
+                        )
+                        value_bets.append(vb_u)
+
+        return value_bets
+
+    def _extract_cards_value_bets(
+        self,
+        game: dict,
+        min_ev_percent: float,
+    ) -> list[ValueBet]:
+        """Extract value bets from cards data (pinnacleCards + spread bookings)."""
+        value_bets = []
+        pinnacle_cards = game.get("pinnacleCards", [])
+        if not pinnacle_cards:
+            return value_bets
+
+        event_name = game.get("event", "")
+        competition = game.get("competition", {})
+        comp_name = competition.get("name", "") if isinstance(competition, dict) else ""
+
+        parts = event_name.split(" v ", 1)
+        home = parts[0].strip() if len(parts) == 2 else event_name
+        away = parts[1].strip() if len(parts) == 2 else ""
+        match = Match(
+            home_team=home,
+            away_team=away,
+            league=comp_name,
+            match_id=str(game.get("id", "")),
+        )
+
+        # Parse Pinnacle cards lines
+        pinnacle_lines: dict[float, dict[str, float]] = {}
+        for entry in pinnacle_cards:
+            sel = entry.get("selection", {})
+            name = sel.get("name", "")
+            odds = entry.get("odds", 0)
+            if not odds or odds <= 1:
+                continue
+            for prefix, direction in [("Over ", "over"), ("Under ", "under")]:
+                if name.startswith(prefix):
+                    try:
+                        line = float(name[len(prefix):])
+                    except ValueError:
+                        continue
+                    pinnacle_lines.setdefault(line, {})[direction] = odds
+
+        # Get spread bookings data (in booking points: yellow=10, red=25)
+        spread_cards_mean = None
+        for spread_key in ("spreadex", "starspreads"):
+            spread_data = game.get(spread_key, {})
+            if isinstance(spread_data, dict):
+                bookings = spread_data.get("bookings", {})
+                if isinstance(bookings, dict):
+                    buy = bookings.get("buy", 0)
+                    sell = bookings.get("sell", 0)
+                    if buy and sell:
+                        # Convert booking points to approximate card count
+                        # Midpoint in points / 10 (yellow card value) ≈ total cards
+                        spread_cards_mean = (buy + sell) / 2.0 / 10.0
+                        break
+
+        for line, odds_pair in pinnacle_lines.items():
+            over_odds = odds_pair.get("over")
+            under_odds = odds_pair.get("under")
+            if not over_odds:
+                continue
+
+            if under_odds:
+                fair_over = _fair_odds_from_bookie_market(
+                    over_odds, [over_odds, under_odds]
+                )
+            else:
+                fair_over = over_odds
+
+            if spread_cards_mean:
+                spread_fair = _poisson_fair_over(spread_cards_mean, line)
+                if fair_over != float("inf") and spread_fair != float("inf"):
+                    avg_prob = (1 / fair_over + 1 / spread_fair) / 2
+                    fair_over = 1 / max(avg_prob, 0.001)
+
+            if fair_over <= 1.0 or fair_over == float("inf"):
+                continue
+
+            ev = (over_odds / fair_over - 1) * 100
+            if abs(ev) >= min_ev_percent:
+                line_display = _line_to_display(line)
+                value_bets.append(ValueBet(
+                    match=match,
+                    bookmaker="Pinnacle",
+                    market_type=MarketType.CARDS,
+                    selection=f"Match Cards - Over {line_display}",
+                    line=line,
+                    direction=BetDirection.OVER,
+                    book_odds=over_odds,
+                    fair_odds=round(fair_over, 3),
+                    ev_percent=round(ev, 2),
+                ))
 
         return value_bets
 
@@ -479,11 +755,19 @@ class BBDailyScraper:
         logger.info("Processing %d upcoming games for player stats", len(upcoming))
 
         for game in upcoming:
+            # Player + team-level stats from playerStatsData
             psd = game.get("playerStatsData")
-            if not psd:
-                continue
-            bets = self._extract_player_value_bets(game, min_ev_percent)
-            value_bets.extend(bets)
+            if psd:
+                bets = self._extract_player_value_bets(game, min_ev_percent)
+                value_bets.extend(bets)
+
+            # Team-level corners from pinnacleCorners + spread data
+            corner_bets = self._extract_corners_value_bets(game, min_ev_percent)
+            value_bets.extend(corner_bets)
+
+            # Team-level cards from pinnacleCards + spread data
+            card_bets = self._extract_cards_value_bets(game, min_ev_percent)
+            value_bets.extend(card_bets)
 
         # Validate against real player stats if available
         if stats_provider and stats_provider.is_available:
@@ -548,24 +832,20 @@ class BBDailyScraper:
     def _selection_to_market_key(selection: str) -> str | None:
         """Convert selection text back to BB market key for stats lookup."""
         sel = selection.lower()
-        if "over sot" in sel or "over  sot" in sel:
-            return "overSot"
-        if "under sot" in sel or "under  sot" in sel:
-            return "underSot"
-        if "over shots" in sel:
-            return "overShots"
-        if "under shots" in sel:
-            return "underShots"
-        if "over fouls won" in sel:
+        if "sot" in sel:
+            return "overSot" if "over" in sel else "underSot"
+        if "shots" in sel:
+            return "overShots" if "over" in sel else "underShots"
+        if "fouls won" in sel:
             return "overFoulsWon"
-        if "over fouls" in sel:
+        if "fouls" in sel:
             return "overFouls"
-        if "over tackles" in sel:
+        if "tackles" in sel:
             return "overTackles"
-        if "over passes" in sel:
+        if "passes" in sel:
             return "overPasses"
-        if "over offsides" in sel:
+        if "offsides" in sel:
             return "overOffsides"
-        if "over cards" in sel:
+        if "cards" in sel:
             return "overPlayer_cards"
         return None
