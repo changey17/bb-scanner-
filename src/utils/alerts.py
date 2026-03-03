@@ -73,42 +73,51 @@ async def send_discord_alert(bets: list[ValueBet], config: Config) -> None:
 
     embeds = []
     for bet in bets[:10]:  # Discord limits embeds
+        fields = [
+            {
+                "name": "Market",
+                "value": bet.selection,
+                "inline": False,
+            },
+            {"name": "League", "value": bet.match.league or "—", "inline": True},
+            {
+                "name": "EV",
+                "value": f"**{bet.ev_percent:+.1f}%**",
+                "inline": True,
+            },
+            {
+                "name": f"{bet.bookmaker} Odds (Scraped)",
+                "value": f"**{bet.book_odds:.2f}**",
+                "inline": True,
+            },
+            {
+                "name": "Fair Odds (BB Calc)",
+                "value": f"**{bet.fair_odds:.2f}**",
+                "inline": True,
+            },
+            {
+                "name": "Edge",
+                "value": f"{bet.edge:+.1f}%",
+                "inline": True,
+            },
+        ]
+
+        # Add real stats info if available
+        if bet.stats_avg is not None:
+            status = "SUPPORTED" if bet.stats_supported else "WEAK"
+            fields.append({
+                "name": f"Player Stats ({status})",
+                "value": (
+                    f"Season avg: **{bet.stats_avg:.1f}/90** | {bet.stats_note}"
+                ),
+                "inline": False,
+            })
+
         embeds.append(
             {
                 "title": f"{bet.bookmaker} | {bet.match.display_name}",
                 "color": 0x00FF00 if bet.ev_percent >= 5 else 0xFFFF00,
-                "fields": [
-                    {"name": "League", "value": bet.match.league or "—", "inline": True},
-                    {
-                        "name": "Market",
-                        "value": bet.selection,
-                        "inline": True,
-                    },
-                    {
-                        "name": "EV",
-                        "value": f"**{bet.ev_percent:+.1f}%**",
-                        "inline": True,
-                    },
-                    {"name": "Selection", "value": bet.selection, "inline": False},
-                    {
-                        "name": "Book Odds",
-                        "value": f"**{bet.book_odds:.2f}**",
-                        "inline": True,
-                    },
-                    {
-                        "name": "Fair Odds",
-                        "value": f"{bet.fair_odds:.2f}",
-                        "inline": True,
-                    },
-                    *([{
-                        "name": "Stats",
-                        "value": (
-                            f"{'OK' if bet.stats_supported else 'WEAK'} "
-                            f"({bet.stats_avg:.1f}/90) {bet.stats_note}"
-                        ),
-                        "inline": False,
-                    }] if bet.stats_avg is not None else []),
-                ],
+                "fields": fields,
                 "timestamp": bet.timestamp.isoformat(),
             }
         )
@@ -135,7 +144,8 @@ async def send_telegram_alert(bets: list[ValueBet], config: Config) -> None:
             f"*{bet.match.display_name}*\n"
             f"  {bet.match.league}\n"
             f"  {bet.selection}\n"
-            f"  {bet.bookmaker} @ `{bet.book_odds:.2f}` | Fair: `{bet.fair_odds:.2f}`\n"
+            f"  {bet.bookmaker} Odds (Scraped): `{bet.book_odds:.2f}`\n"
+            f"  Fair Odds (BB Calc): `{bet.fair_odds:.2f}`\n"
             f"  EV: *{bet.ev_percent:+.1f}%*\n"
         )
 

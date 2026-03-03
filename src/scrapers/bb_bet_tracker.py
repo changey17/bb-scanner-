@@ -75,6 +75,32 @@ def _match_market_type(text: str) -> MarketType | None:
     return None
 
 
+def _format_selection(name: str, line: float, direction: BetDirection | None) -> str:
+    """Format the selection text converting decimal lines to bookmaker notation.
+
+    Converts: 'Over 0.5 Tackles' -> 'Over 1+ Tackles'
+              'Under 1.5 Shots' -> 'Under 2+ Shots'
+    """
+    if line <= 0:
+        return name
+
+    # Convert line to display format
+    if line == int(line) + 0.5:
+        display = f"{int(line + 0.5)}+"
+    elif line == int(line):
+        display = str(int(line))
+    else:
+        display = str(line)
+
+    # Replace the raw decimal line in the name with bookmaker notation
+    # Try patterns like "0.5", "1.5", "2.5" etc.
+    raw_line = f"{line:g}"
+    if raw_line in name:
+        return name.replace(raw_line, display, 1)
+
+    return name
+
+
 class BBBetTrackerScraper:
     """Scrapes bet tracker data via BB's API."""
 
@@ -233,6 +259,9 @@ class BBBetTrackerScraper:
         book_id = bet.get("bookid", bet.get("book_id", 0))
         bookie_name = book_map.get(book_id, str(book_id))
 
+        # Format selection with bookmaker notation (0.5 -> 1+, 1.5 -> 2+)
+        selection = _format_selection(name, line, direction)
+
         return ValueBet(
             match=Match(
                 home_team=home or name,
@@ -241,7 +270,7 @@ class BBBetTrackerScraper:
             ),
             bookmaker=bookie_name,
             market_type=market_type,
-            selection=name,
+            selection=selection,
             line=line,
             direction=direction,
             book_odds=book_odds,

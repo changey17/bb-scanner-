@@ -110,8 +110,8 @@ class ValueBet:
             f"VALUE BET | {self.match.display_name}\n"
             f"  League: {self.match.league}\n"
             f"  Market: {self.selection}\n"
-            f"  Bookmaker: {self.bookmaker} @ {self.book_odds:.2f}\n"
-            f"  Fair Odds: {self.fair_odds:.2f}\n"
+            f"  {self.bookmaker} Odds (Scraped): {self.book_odds:.2f}\n"
+            f"  Fair Odds (BB Calc): {self.fair_odds:.2f}\n"
             f"  EV: {self.ev_percent:+.1f}%\n"
             f"  Edge: {self.edge:+.1f}%"
         )
