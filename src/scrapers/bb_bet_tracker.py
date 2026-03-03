@@ -76,24 +76,19 @@ def _match_market_type(text: str) -> MarketType | None:
 
 
 def _format_selection(name: str, line: float, direction: BetDirection | None) -> str:
-    """Format the selection text converting decimal lines to bookmaker notation.
+    """Format the selection text using BB notation (Over 0, Over 1, etc).
 
-    Converts: 'Over 0.5 Tackles' -> 'Over 1+ Tackles'
-              'Under 1.5 Shots' -> 'Under 2+ Shots'
+    Converts: 'Over 0.5 Tackles' -> 'Over 0 Tackles'
+              'Under 1.5 Shots' -> 'Under 1 Shots'
+    Matches the line notation shown on BB's player stats page.
     """
+    import math
+
     if line <= 0:
         return name
 
-    # Convert line to display format
-    if line == int(line) + 0.5:
-        display = f"{int(line + 0.5)}+"
-    elif line == int(line):
-        display = str(int(line))
-    else:
-        display = str(line)
+    display = str(math.floor(line))
 
-    # Replace the raw decimal line in the name with bookmaker notation
-    # Try patterns like "0.5", "1.5", "2.5" etc.
     raw_line = f"{line:g}"
     if raw_line in name:
         return name.replace(raw_line, display, 1)

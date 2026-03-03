@@ -3,11 +3,13 @@
 Uses the Node.js REST API at /node/rest/goals/list to fetch live football
 match data including player-level stats odds from bookmakers.
 
-Fair odds are computed using BB's own methodology:
-1. Poisson reverse-engineering of expected stats from bookmaker odds
-2. Optimism adjustment (from BB's config) applied to fair probability
-3. Polynomial adjustment (A*x² + B*x + C, clamped to [D, E]) on the mean
-4. Trimmed mean across bookmakers for consensus fair value
+Fair odds are computed by replicating BB's own client-side methodology
+(from their daily-goals Vue.js bundle):
+1. For each bookmaker, reverse-engineer Poisson mean from odds + optimism
+2. When only over odds available, estimate under odds (BB's xFromOver formula)
+3. Average means across ALL bookmakers (trimmed if over-only flag & 5+)
+4. Apply polynomial adjustment (player poly for individuals, match poly for teams)
+5. Fair odds = 1/poissonOver(xStat, floor(handicap)) — the purple price on BB
 
 Auth uses custom headers extracted from the vue_config element on the page:
     X-BB-User, X-BB-Hash, X-BB-Userid, X-BB-Userlevel
@@ -89,7 +91,7 @@ STATS_MARKETS = {
 # Special "player" names that are actually team-level entries
 TEAM_LEVEL_NAMES = {"Home", "Away", "match"}
 
-# Readable market labels for display
+# Readable market labels for display (uses BB's "Over N" notation)
 MARKET_LABELS = {
     "overSot": "Over {n} SOT",
     "underSot": "Under {n} SOT",
@@ -108,25 +110,15 @@ MARKET_LABELS = {
 
 
 def _line_to_display(handicap: float) -> str:
-    """Convert decimal handicap to bookmaker display format.
+    """Convert decimal handicap to BB's display format.
 
-    Bookmakers display: 1+ (=Over 0.5), 2+ (=Over 1.5), 3+ (=Over 2.5).
-    For whole number lines like corners (Over 10.5), use standard notation.
+    BB website shows: Over 0 (=handicap 0.5), Over 1 (=handicap 1.5), etc.
+    This matches the purple fair-odds column headers on BB's player stats page.
     """
-    # For half-lines (.5), convert to N+ format
-    if handicap == int(handicap) + 0.5:
-        n_plus = int(handicap + 0.5)
-        return f"{n_plus}+"
-    # For whole number lines, show as integer
-    if handicap == int(handicap):
-        return str(int(handicap))
-    return str(handicap)
+    return str(math.floor(handicap))
 
 BASE_URL = "https://www.bookiebashing.net/node"
 DAILY_PAGE = "https://www.bookiebashing.net/tools/daily/"
-
-# Sub percentage: player-level stats reduced by this % (bench/sub time)
-DEFAULT_SUB_PERCENTAGE = 9.5
 
 
 # --- Poisson math (mirrors BB's JavaScript calculations) ---
@@ -223,31 +215,51 @@ def _poisson_fair_over(mean: float, line: float) -> float:
     return 1.0 / prob
 
 
-def _apply_polynomial(mean: float, poly_config: dict | None) -> float:
+def _apply_polynomial(
+    mean: float, poly_config: dict | None, is_team: bool = False,
+) -> float:
     """Apply BB's polynomial adjustment to a Poisson mean.
 
     BB's formula: adjustment = min(E, max(D, A*x² + B*x + C))
     Then: adjusted_mean = mean * adjustment
 
-    Uses the 'player' polynomial for individual player stats.
+    Uses 'player' polynomial for individual players, 'match' for team entries.
     """
     if not poly_config or not isinstance(poly_config, dict):
         return mean
 
-    player_poly = poly_config.get("player", {})
-    if not player_poly:
+    poly_key = "match" if is_team else "player"
+    poly = poly_config.get(poly_key, {})
+    if not poly:
         return mean
 
-    a = float(player_poly.get("A", 0) or 0)
-    b = float(player_poly.get("B", 0) or 0)
-    c = float(player_poly.get("C", 1) or 1)
-    d = float(player_poly.get("D", 0) or 0)
-    e = float(player_poly.get("E", 2) or 2)
+    a = float(poly.get("A", 0) or 0)
+    b = float(poly.get("B", 0) or 0)
+    c = float(poly.get("C", 1) or 1)
+    d = float(poly.get("D", 0) or 0)
+    e = float(poly.get("E", 2) or 2)
 
     adjustment = a * mean**2 + b * mean + c
     adjustment = min(e, max(d, adjustment))
 
     return mean * adjustment
+
+
+def _estimate_under_from_over(over_odds: float) -> float:
+    """Estimate under odds from over odds using BB's xFromOver formula.
+
+    Mirrors the quadratic estimation in BB's JavaScript:
+        l = -0.165 * (1/t)^2 + 0.1797/t + 1.0301
+        under = max(1.01, 1/(l - 1/t))
+    """
+    if over_odds <= 1.0:
+        return 1.01
+    inv = 1.0 / over_odds
+    l = -0.165 * inv**2 + 0.1797 * inv + 1.0301
+    denom = l - inv
+    if denom <= 0:
+        return 1.01
+    return max(1.01, 1.0 / denom)
 
 
 def _estimate_mean_from_odds(
@@ -256,15 +268,23 @@ def _estimate_mean_from_odds(
     handicap: float,
     optimism: float | None = None,
 ) -> float:
-    """Estimate expected stat value from bookmaker odds using reverse Poisson."""
+    """Estimate expected stat value from bookmaker odds using reverse Poisson.
+
+    If under odds are missing, estimates them using BB's quadratic formula.
+    Always applies optimism via fairOddsFromBookieMarket (power method).
+    """
     line = math.floor(handicap)
 
-    if under_odds and under_odds > 0:
+    if under_odds and under_odds > 1.0:
         fair_over = _fair_odds_from_bookie_market(
             over_odds, [over_odds, under_odds], optimism
         )
     else:
-        fair_over = over_odds
+        # Estimate under odds like BB's xFromOver
+        est_under = _estimate_under_from_over(over_odds)
+        fair_over = _fair_odds_from_bookie_market(
+            over_odds, [over_odds, est_under], optimism
+        )
 
     return _reverse_poisson_over(fair_over, line)
 
@@ -346,14 +366,13 @@ class BBDailyScraper:
     ) -> list[ValueBet]:
         """Extract value bets from a single game's playerStatsData.
 
-        Uses BB's own fair value methodology:
-        1. For each bookmaker, derive Poisson mean using BB's optimism setting
-        2. Average means across bookmakers (trimmed if 5+)
-        3. Apply BB's polynomial adjustment to the consensus mean
-        4. Compute fair odds from adjusted mean using Poisson
-        5. Compare target bookmaker's price to fair odds
-
-        Requires at least 2 bookmakers total to establish a fair mean.
+        Replicates BB's xPlayer calculation exactly:
+        1. For each bookmaker, derive Poisson mean (with optimism + estimated under)
+        2. Average ALL bookmaker means (trimmed if over-only flag & 5+ entries)
+        3. Apply polynomial adjustment (player poly for individuals, match for teams)
+        4. xStat = the resulting expected value (matches BB's purple fair price)
+        5. Fair odds = 1/poissonOver(xStat, floor(handicap))
+        6. Compare target bookmaker's price to BB fair odds
         """
         value_bets = []
         psd = game.get("playerStatsData", {})
@@ -374,14 +393,13 @@ class BBDailyScraper:
             match_id=str(game.get("id", "")),
         )
 
-        # Step 1: Collect data from ALL bookmakers per player per market
-        all_data: dict[str, dict[str, list[tuple]]] = {}
-        target_entries: dict[str, dict[str, list[tuple]]] = {}
+        # Step 1: Transpose playerStatsData to player-centric structure
+        # player_name → market_key → [(bookie_raw, odds, handicap, under_odds)]
+        player_data: dict[str, dict[str, list[tuple]]] = {}
 
         for bookie_raw, players in psd.items():
             if not isinstance(players, dict):
                 continue
-            is_target = bookie_raw in TARGET_BOOKMAKERS
 
             for player_name, markets in players.items():
                 if not isinstance(markets, dict):
@@ -405,21 +423,24 @@ class BBDailyScraper:
                         if isinstance(under_data, dict):
                             under_odds = under_data.get("odds")
 
-                    all_data.setdefault(player_name, {}).setdefault(market_key, []).append(
-                        (bookie_raw, odds, handicap, under_odds)
-                    )
+                    player_data.setdefault(player_name, {}).setdefault(
+                        market_key, []
+                    ).append((bookie_raw, odds, handicap, under_odds))
 
-                    if is_target:
-                        display = TARGET_BOOKMAKERS[bookie_raw]
-                        target_entries.setdefault(player_name, {}).setdefault(market_key, []).append(
-                            (display, odds, handicap)
-                        )
+        # Step 2: For each player+market, compute xStat using ALL bookmakers
+        for player_name, markets in player_data.items():
+            for market_key, entries in markets.items():
+                # Need at least 2 bookmakers for a meaningful consensus
+                if len(entries) < 2:
+                    continue
 
-        # Step 2: For each player+market with target bookmaker entries
-        for player_name, markets in target_entries.items():
-            for market_key, targets in markets.items():
-                all_entries = all_data.get(player_name, {}).get(market_key, [])
-                if len(all_entries) < 2:
+                # Check if any target bookmakers have entries for this market
+                target_list = [
+                    (TARGET_BOOKMAKERS[bk], od, hc)
+                    for bk, od, hc, _ in entries
+                    if bk in TARGET_BOOKMAKERS
+                ]
+                if not target_list:
                     continue
 
                 market_info = MARKET_MAP.get(market_key)
@@ -432,59 +453,52 @@ class BBDailyScraper:
                 optimism = self._get_optimism(stat_name)
                 polynomial = self._get_polynomial(stat_name)
 
-                for display_name, odds, handicap in targets:
-                    # Estimate fair mean from OTHER bookmakers (exclude self)
-                    means = []
-                    has_under = False
-                    for other_bookie, other_odds, other_hcap, other_under in all_entries:
-                        if TARGET_BOOKMAKERS.get(other_bookie) == display_name:
-                            continue
-                        if other_under and other_under > 0:
-                            has_under = True
-                        est_mean = _estimate_mean_from_odds(
-                            other_odds, other_under, other_hcap, optimism
-                        )
-                        if 0 < est_mean < 100:
-                            means.append(est_mean)
+                # Compute Poisson mean from ALL bookmakers (BB includes all)
+                means = []
+                has_only_over = False
+                for _, bk_odds, bk_hcap, bk_under in entries:
+                    if not bk_under or bk_under <= 1.0:
+                        has_only_over = True
+                    est_mean = _estimate_mean_from_odds(
+                        bk_odds, bk_under, bk_hcap, optimism
+                    )
+                    if 0 < est_mean < 100:
+                        means.append(est_mean)
 
-                    if len(means) < 3:
-                        continue
+                if len(means) < 2:
+                    continue
 
-                    # Trim if 5+ means and only-over (no under markets)
-                    means.sort()
-                    if not has_under and len(means) > 5:
-                        means = means[1:-1]
-                    elif len(means) >= 5:
-                        trimmed = means[1:-1]
-                        means = trimmed
+                # BB trims when over-only flag set AND 5+ entries
+                means.sort()
+                if has_only_over and len(means) > 5:
+                    means = means[1:-1]
 
-                    fair_mean = sum(means) / len(means)
+                x_stat = sum(means) / len(means)
 
-                    # Apply BB's polynomial adjustment
-                    fair_mean = _apply_polynomial(fair_mean, polynomial)
+                # Apply polynomial adjustment
+                is_team = player_name in TEAM_LEVEL_NAMES
+                x_stat = _apply_polynomial(x_stat, polynomial, is_team=is_team)
 
-                    # Apply sub percentage reduction for player-level stats
-                    sub_pct = DEFAULT_SUB_PERCENTAGE
-                    if self._bb_config:
-                        sub_pct = self._bb_config.get("subPercentage", sub_pct)
-                    fair_mean *= (1 - sub_pct / 100)
+                if x_stat <= 0:
+                    continue
 
-                    fair_odds = _poisson_fair_over(fair_mean, handicap)
+                # Step 3: For each target bookmaker, compute fair odds at THEIR line
+                for display_name, bk_odds, bk_hcap in target_list:
+                    fair_odds = _poisson_fair_over(x_stat, bk_hcap)
 
                     if fair_odds <= 1.0 or fair_odds == float("inf"):
                         continue
 
-                    ev_percent = (odds / fair_odds - 1) * 100
+                    ev_percent = (bk_odds / fair_odds - 1) * 100
 
                     if ev_percent < min_ev_percent:
                         continue
 
-                    # Build readable selection label
-                    line_display = _line_to_display(handicap)
+                    # Build label using BB notation: "Over 0" not "1+"
+                    line_display = _line_to_display(bk_hcap)
                     label_tmpl = MARKET_LABELS.get(market_key, market_key)
                     stat_label = label_tmpl.format(n=line_display)
 
-                    # Prefix with player or team name
                     if player_name in TEAM_LEVEL_NAMES:
                         prefix = f"{player_name} Team"
                     else:
@@ -495,9 +509,9 @@ class BBDailyScraper:
                         bookmaker=display_name,
                         market_type=market_type,
                         selection=f"{prefix} - {stat_label}",
-                        line=handicap,
+                        line=bk_hcap,
                         direction=direction,
-                        book_odds=odds,
+                        book_odds=bk_odds,
                         fair_odds=round(fair_odds, 3),
                         ev_percent=round(ev_percent, 2),
                     )

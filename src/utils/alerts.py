@@ -91,7 +91,7 @@ async def send_discord_alert(bets: list[ValueBet], config: Config) -> None:
                 "inline": True,
             },
             {
-                "name": "Fair Odds (BB Calc)",
+                "name": "BB Fair Odds",
                 "value": f"**{bet.fair_odds:.2f}**",
                 "inline": True,
             },
@@ -145,7 +145,7 @@ async def send_telegram_alert(bets: list[ValueBet], config: Config) -> None:
             f"  {bet.match.league}\n"
             f"  {bet.selection}\n"
             f"  {bet.bookmaker} Odds (Scraped): `{bet.book_odds:.2f}`\n"
-            f"  Fair Odds (BB Calc): `{bet.fair_odds:.2f}`\n"
+            f"  BB Fair Odds: `{bet.fair_odds:.2f}`\n"
             f"  EV: *{bet.ev_percent:+.1f}%*\n"
         )
 

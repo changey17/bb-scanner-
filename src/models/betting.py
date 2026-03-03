@@ -111,7 +111,7 @@ class ValueBet:
             f"  League: {self.match.league}\n"
             f"  Market: {self.selection}\n"
             f"  {self.bookmaker} Odds (Scraped): {self.book_odds:.2f}\n"
-            f"  Fair Odds (BB Calc): {self.fair_odds:.2f}\n"
+            f"  BB Fair Odds: {self.fair_odds:.2f}\n"
             f"  EV: {self.ev_percent:+.1f}%\n"
             f"  Edge: {self.edge:+.1f}%"
         )
