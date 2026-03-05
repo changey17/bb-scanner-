@@ -315,11 +315,9 @@ def _correct_handicaps(
         mean = _estimate_mean_from_odds(bk_odds, bk_under, bk_hcap, optimism)
         entry_means.append(mean)
 
-    valid_means = sorted(m for m in entry_means if 0 < m < 100)
-    if len(valid_means) < 2:
+    valid_count = sum(1 for m in entry_means if 0 < m < 100)
+    if valid_count < 2:
         return entries
-
-    median_mean = valid_means[len(valid_means) // 2]
 
     corrected = []
     for i, (bk_raw, bk_odds, bk_hcap, bk_under) in enumerate(entries):
@@ -329,14 +327,24 @@ def _correct_handicaps(
             corrected.append((bk_raw, bk_odds, bk_hcap, bk_under))
             continue
 
-        ratio = mean / median_mean if median_mean > 0 else 1.0
-        if 0.4 < ratio < 2.5:
+        # Compare against median of OTHER entries (excluding self) for robustness
+        # This prevents the outlier itself from pulling the reference toward it
+        other_means = sorted(
+            m for j, m in enumerate(entry_means) if j != i and 0 < m < 100
+        )
+        if not other_means:
+            corrected.append((bk_raw, bk_odds, bk_hcap, bk_under))
+            continue
+        ref_median = other_means[len(other_means) // 2]
+
+        ratio = mean / ref_median if ref_median > 0 else 1.0
+        if 0.5 < ratio < 2.0:
             corrected.append((bk_raw, bk_odds, bk_hcap, bk_under))
             continue
 
         # Mean is far from consensus — try correcting handicap
         best_hcap = bk_hcap
-        best_diff = abs(mean - median_mean)
+        best_diff = abs(mean - ref_median)
 
         for offset in [1.0, -1.0, 2.0]:
             trial_hcap = bk_hcap + offset
@@ -346,7 +354,7 @@ def _correct_handicaps(
                 bk_odds, bk_under, trial_hcap, optimism
             )
             if 0 < trial_mean < 100:
-                trial_diff = abs(trial_mean - median_mean)
+                trial_diff = abs(trial_mean - ref_median)
                 if trial_diff < best_diff:
                     best_diff = trial_diff
                     best_hcap = trial_hcap
