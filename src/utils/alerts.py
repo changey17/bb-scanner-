@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 from rich.console import Console
@@ -102,6 +102,21 @@ async def send_discord_alert(bets: list[ValueBet], config: Config) -> None:
             },
         ]
 
+        # Add kick-off time
+        if bet.match.kick_off:
+            now_utc = datetime.now(timezone.utc)
+            delta_h = (bet.match.kick_off - now_utc).total_seconds() / 3600
+            if delta_h > 0:
+                ko_time = bet.match.kick_off.strftime("%H:%M UTC")
+                ko_label = f"**{ko_time}**"
+                if delta_h <= 24:
+                    ko_label += f" (in {delta_h:.0f}h)"
+                fields.append({
+                    "name": "Kick Off",
+                    "value": ko_label,
+                    "inline": True,
+                })
+
         # Add real stats info if available
         if bet.stats_avg is not None:
             status = "SUPPORTED" if bet.stats_supported else "WEAK"
@@ -140,9 +155,17 @@ async def send_telegram_alert(bets: list[ValueBet], config: Config) -> None:
 
     lines = [f"*{len(bets)} Value Bet(s) Found*\n"]
     for bet in bets:
+        ko_line = ""
+        if bet.match.kick_off:
+            now_utc = datetime.now(timezone.utc)
+            delta_h = (bet.match.kick_off - now_utc).total_seconds() / 3600
+            if delta_h > 0:
+                ko_time = bet.match.kick_off.strftime("%H:%M UTC")
+                ko_line = f"  KO: {ko_time} ({delta_h:.0f}h)\n"
         lines.append(
             f"*{bet.match.display_name}*\n"
             f"  {bet.match.league}\n"
+            f"{ko_line}"
             f"  {bet.selection}\n"
             f"  {bet.bookmaker} Odds (Scraped): `{bet.book_odds:.2f}`\n"
             f"  BB Fair Odds: `{bet.fair_odds:.2f}`\n"

@@ -22,6 +22,7 @@ import logging
 import math
 import re
 import time
+from datetime import datetime, timezone
 
 import httpx
 
@@ -289,6 +290,77 @@ def _estimate_mean_from_odds(
     return _reverse_poisson_over(fair_over, line)
 
 
+def _correct_handicaps(
+    entries: list[tuple],
+    optimism: float | None,
+) -> list[tuple]:
+    """Detect and correct wrong handicap values in bookmaker entries.
+
+    BB's API sometimes reports incorrect handicap values for certain bookmakers
+    (notably William Hill). For example, WH may have handicap=0.5 with odds=7.00
+    for tackles, while other bookmakers at handicap=0.5 have odds=2.50. The 7.00
+    odds clearly correspond to handicap=1.5 (Over 1 = 2+ tackles), not 0.5.
+
+    Detection: compute each bookmaker's implied Poisson mean from their odds +
+    stated handicap. If a bookmaker's mean differs >2.5x from the median, try
+    alternative handicap values. Use the handicap that brings the mean closest
+    to the consensus.
+    """
+    if len(entries) < 2:
+        return entries
+
+    # Compute implied means at stated handicaps
+    entry_means = []
+    for bk_raw, bk_odds, bk_hcap, bk_under in entries:
+        mean = _estimate_mean_from_odds(bk_odds, bk_under, bk_hcap, optimism)
+        entry_means.append(mean)
+
+    valid_means = sorted(m for m in entry_means if 0 < m < 100)
+    if len(valid_means) < 2:
+        return entries
+
+    median_mean = valid_means[len(valid_means) // 2]
+
+    corrected = []
+    for i, (bk_raw, bk_odds, bk_hcap, bk_under) in enumerate(entries):
+        mean = entry_means[i]
+
+        if mean <= 0 or mean >= 100:
+            corrected.append((bk_raw, bk_odds, bk_hcap, bk_under))
+            continue
+
+        ratio = mean / median_mean if median_mean > 0 else 1.0
+        if 0.4 < ratio < 2.5:
+            corrected.append((bk_raw, bk_odds, bk_hcap, bk_under))
+            continue
+
+        # Mean is far from consensus — try correcting handicap
+        best_hcap = bk_hcap
+        best_diff = abs(mean - median_mean)
+
+        for offset in [1.0, -1.0, 2.0]:
+            trial_hcap = bk_hcap + offset
+            if trial_hcap < 0.5:
+                continue
+            trial_mean = _estimate_mean_from_odds(
+                bk_odds, bk_under, trial_hcap, optimism
+            )
+            if 0 < trial_mean < 100:
+                trial_diff = abs(trial_mean - median_mean)
+                if trial_diff < best_diff:
+                    best_diff = trial_diff
+                    best_hcap = trial_hcap
+
+        if best_hcap != bk_hcap:
+            logger.info(
+                "Handicap correction: %s %.1f->%.1f (odds=%.2f)",
+                bk_raw, bk_hcap, best_hcap, bk_odds,
+            )
+        corrected.append((bk_raw, bk_odds, best_hcap, bk_under))
+
+    return corrected
+
+
 class BBDailyScraper:
     """Scrapes player stats from BB's Daily Goals tool via Node.js API."""
 
@@ -359,6 +431,30 @@ class BBDailyScraper:
         poly = self._bb_config.get("optimismPolynomial", {})
         return poly.get(stat_name, poly.get("shots"))
 
+    def _make_match(self, game: dict) -> Match:
+        """Create a Match from a game dict, including kick-off time."""
+        event_name = game.get("event", "")
+        competition = game.get("competition", {})
+        comp_name = (
+            competition.get("name", "") if isinstance(competition, dict) else ""
+        )
+        parts = event_name.split(" v ", 1)
+        home = parts[0].strip() if len(parts) == 2 else event_name
+        away = parts[1].strip() if len(parts) == 2 else ""
+        start_ms = game.get("startTime", 0)
+        kick_off = (
+            datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+            if start_ms
+            else None
+        )
+        return Match(
+            home_team=home,
+            away_team=away,
+            league=comp_name,
+            match_id=str(game.get("id", "")),
+            kick_off=kick_off,
+        )
+
     def _extract_player_value_bets(
         self,
         game: dict,
@@ -379,19 +475,7 @@ class BBDailyScraper:
         if not isinstance(psd, dict):
             return value_bets
 
-        event_name = game.get("event", "")
-        competition = game.get("competition", {})
-        comp_name = competition.get("name", "") if isinstance(competition, dict) else ""
-
-        parts = event_name.split(" v ", 1)
-        home = parts[0].strip() if len(parts) == 2 else event_name
-        away = parts[1].strip() if len(parts) == 2 else ""
-        match = Match(
-            home_team=home,
-            away_team=away,
-            league=comp_name,
-            match_id=str(game.get("id", "")),
-        )
+        match = self._make_match(game)
 
         # Step 1: Transpose playerStatsData to player-centric structure
         # player_name → market_key → [(bookie_raw, odds, handicap, under_odds)]
@@ -434,15 +518,6 @@ class BBDailyScraper:
                 if len(entries) < 2:
                     continue
 
-                # Check if any target bookmakers have entries for this market
-                target_list = [
-                    (TARGET_BOOKMAKERS[bk], od, hc)
-                    for bk, od, hc, _ in entries
-                    if bk in TARGET_BOOKMAKERS
-                ]
-                if not target_list:
-                    continue
-
                 market_info = MARKET_MAP.get(market_key)
                 if not market_info:
                     continue
@@ -452,6 +527,18 @@ class BBDailyScraper:
                 stat_name = MARKET_TO_STAT.get(market_key, "shots")
                 optimism = self._get_optimism(stat_name)
                 polynomial = self._get_polynomial(stat_name)
+
+                # Correct wrong handicap values (BB API has errors for some bookmakers)
+                entries = _correct_handicaps(entries, optimism)
+
+                # Check if any target bookmakers have entries for this market
+                target_list = [
+                    (TARGET_BOOKMAKERS[bk], od, hc)
+                    for bk, od, hc, _ in entries
+                    if bk in TARGET_BOOKMAKERS
+                ]
+                if not target_list:
+                    continue
 
                 # Compute Poisson mean from ALL bookmakers (BB includes all)
                 means = []
@@ -533,19 +620,7 @@ class BBDailyScraper:
         alternative fair value estimate.
         """
         value_bets = []
-        event_name = game.get("event", "")
-        competition = game.get("competition", {})
-        comp_name = competition.get("name", "") if isinstance(competition, dict) else ""
-
-        parts = event_name.split(" v ", 1)
-        home = parts[0].strip() if len(parts) == 2 else event_name
-        away = parts[1].strip() if len(parts) == 2 else ""
-        match = Match(
-            home_team=home,
-            away_team=away,
-            league=comp_name,
-            match_id=str(game.get("id", "")),
-        )
+        match = self._make_match(game)
 
         # Get Pinnacle corners data (sharp benchmark)
         pinnacle_corners = game.get("pinnacleCorners", [])
@@ -667,19 +742,7 @@ class BBDailyScraper:
         if not pinnacle_cards:
             return value_bets
 
-        event_name = game.get("event", "")
-        competition = game.get("competition", {})
-        comp_name = competition.get("name", "") if isinstance(competition, dict) else ""
-
-        parts = event_name.split(" v ", 1)
-        home = parts[0].strip() if len(parts) == 2 else event_name
-        away = parts[1].strip() if len(parts) == 2 else ""
-        match = Match(
-            home_team=home,
-            away_team=away,
-            league=comp_name,
-            match_id=str(game.get("id", "")),
-        )
+        match = self._make_match(game)
 
         # Parse Pinnacle cards lines
         pinnacle_lines: dict[float, dict[str, float]] = {}
@@ -787,8 +850,26 @@ class BBDailyScraper:
         if stats_provider and stats_provider.is_available:
             await self._validate_with_stats(value_bets, stats_provider)
 
-        value_bets.sort(key=lambda b: b.ev_percent, reverse=True)
-        logger.info("Daily Player Stats: %d value bets found", len(value_bets))
+        # Sort: games within 24h first (BB more accurate), then by EV
+        now_utc = datetime.now(timezone.utc)
+
+        def _sort_key(bet: ValueBet) -> tuple:
+            within_24h = False
+            if bet.match.kick_off:
+                hours = (bet.match.kick_off - now_utc).total_seconds() / 3600
+                within_24h = 0 <= hours <= 24
+            return (not within_24h, -bet.ev_percent)
+
+        value_bets.sort(key=_sort_key)
+        n_24h = sum(
+            1 for b in value_bets
+            if b.match.kick_off
+            and 0 <= (b.match.kick_off - now_utc).total_seconds() / 3600 <= 24
+        )
+        logger.info(
+            "Daily Player Stats: %d value bets found (%d within 24h)",
+            len(value_bets), n_24h,
+        )
         return value_bets
 
     async def _validate_with_stats(
